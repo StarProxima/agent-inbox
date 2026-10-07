@@ -1,10 +1,12 @@
 """Hook доставляет ограниченные данные только в установленный контекст сессии."""
 
+import hashlib
 import io
 import json
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +17,7 @@ from agent_inbox.api import build_api
 from agent_inbox.client import ClientError, Config, HubClient
 from agent_inbox.house import House
 from agent_inbox.mailbox import Mailbox
-from agent_inbox.session_client import SessionMailbox
+from agent_inbox.session_client import SessionMailbox, project_group
 from agent_inbox.session_hook import HookClient, identity, main, run_hook
 from agent_inbox.store import InMemoryStore
 
@@ -125,22 +127,28 @@ def letters(result: dict[str, Any]) -> list[dict[str, Any]]:
     return json.loads(text.split("\n", 1)[1])
 
 
+def unread(box: SessionMailbox, target: dict[str, Any]) -> list[str]:
+    return [
+        n["id"]
+        for n in box.client(target["context_id"]).check_inbox(view="full")["items"]
+    ]
+
+
 @pytest.mark.parametrize("engine", ["codex", "claude"])
-def test_route_is_learned_from_own_mail_tool_and_does_not_mark_hub_read(
+def test_route_is_learned_from_own_mail_tool_and_marks_whole_letters_read(
     hook_box: SessionMailbox, engine: str
 ) -> None:
     author, target = join(hook_box, "author"), join(hook_box, "target", engine)
     message = send(hook_box, author, target)
+    long = send(hook_box, author, target, "L" * 1700)
     output = run_hook(
         hook_box, engine, event(hook_box, engine=engine, context=target["context_id"])
     )
     delivered = letters(output)
-    assert [n["id"] for n in delivered] == [message["id"]]
+    assert [n["id"] for n in delivered] == [message["id"], long["id"]]
     assert delivered[0]["body"] == "PRIVATE_BODY"
-    assert [
-        n["id"]
-        for n in hook_box.client(target["context_id"]).check_inbox(view="full")["items"]
-    ] == [message["id"]]
+    # Обрезанное письмо агент дочитывает сам, поэтому оно остаётся непрочитанным.
+    assert unread(hook_box, target) == [long["id"]]
     assert run_hook(hook_box, engine, event(hook_box, engine=engine, name="Stop")) == {}
 
 
@@ -296,17 +304,19 @@ def test_body_subject_and_batch_limits_and_stop_do_not_loop(
 ) -> None:
     author, target = join(hook_box, "author"), join(hook_box, "target")
     ids = {
-        send(hook_box, author, target, "B" * 1700, "S" * 200)["id"] for _ in range(3)
+        send(hook_box, author, target, "B" * 1700, "S" * 200)["id"] for _ in range(4)
     }
     payload = event(hook_box, name="Stop", context=target["context_id"])
     first = run_hook(hook_box, "claude", payload)
     assert first["decision"] == "block"
     batch = letters(first)
-    assert len(batch) == 2
+    assert len(batch) == 3
     assert all(
         len(n["body"]) == 1600 and len(n["subject"]) == 160 and n["truncated"]
         for n in batch
     )
+    # Тот же Stop уже вернул агента к работе: второй возврат подряд запрещён.
+    assert run_hook(hook_box, "claude", {**payload, "stop_hook_active": True}) == {}
     second = run_hook(hook_box, "claude", payload)
     assert second["decision"] == "block"
     assert {n["id"] for n in batch + letters(second)} == ids
@@ -544,3 +554,84 @@ def test_hook_mail_fetch_acknowledges_wake_and_idle_session_can_wake_again(
         == "queued"
     )
     assert len(attempts) == 2
+
+
+def test_session_start_does_not_replay_mail_already_shown(
+    hook_box: SessionMailbox,
+) -> None:
+    author, target = join(hook_box, "author"), join(hook_box, "target")
+    # Длинные письма остаются непрочитанными, как залежи, которые никто не разбирал.
+    ids = [send(hook_box, author, target, "L" * 1700)["id"] for _ in range(2)]
+    first = run_hook(hook_box, "claude", event(hook_box, context=target["context_id"]))
+    assert [n["id"] for n in letters(first)] == ids
+    for name in ("SessionStart", "UserPromptSubmit", "Stop"):
+        assert run_hook(hook_box, "claude", event(hook_box, name=name)) == {}
+    assert unread(hook_box, target) == ids
+
+
+def test_unread_backlog_beyond_one_inbox_page_still_delivers_new_mail(
+    hook_box: SessionMailbox,
+) -> None:
+    author, target = join(hook_box, "author"), join(hook_box, "target")
+    ids = [send(hook_box, author, target, "L" * 1700)["id"] for _ in range(52)]
+    payload = event(hook_box, name="UserPromptSubmit", context=target["context_id"])
+    shown: list[str] = []
+    while result := run_hook(hook_box, "claude", payload):
+        shown += [n["id"] for n in letters(result)]
+    # Непрочитанных больше страницы хаба (50), но каждое письмо пришло ровно один раз.
+    assert shown == ids
+    fresh = send(hook_box, author, target)
+    assert [n["id"] for n in letters(run_hook(hook_box, "claude", payload))] == [
+        fresh["id"]
+    ]
+
+
+def test_stop_returns_agent_only_for_personal_mail(hook_box: SessionMailbox) -> None:
+    author, target = join(hook_box, "author"), join(hook_box, "target")
+    stop = event(hook_box, name="Stop", context=target["context_id"])
+    announcement = hook_box.client(author["context_id"]).send_message(
+        project_group("test-project"), "GROUP_BODY", "Объявление"
+    )
+    assert run_hook(hook_box, "claude", stop) == {}
+    prompt = event(hook_box, name="UserPromptSubmit")
+    assert [n["id"] for n in letters(run_hook(hook_box, "claude", prompt))] == [
+        announcement["id"]
+    ]
+    personal = send(hook_box, author, target)
+    result = run_hook(hook_box, "claude", stop)
+    assert result["decision"] == "block"
+    assert [n["id"] for n in letters(result)] == [personal["id"]]
+
+
+def test_previous_hook_state_starts_after_mail_it_already_showed(
+    hook_box: SessionMailbox,
+) -> None:
+    author, target = join(hook_box, "author"), join(hook_box, "target")
+    old = send(hook_box, author, target)
+    key = hashlib.sha256(json.dumps([HUB, "claude", SESSION, ""]).encode()).hexdigest()
+    state = hook_box.directory.parent / "hook-state" / f"{key}.json"
+    state.parent.mkdir(parents=True)
+    state.write_text(
+        json.dumps({"context_id": target["context_id"], "seen": [old["id"]]})
+    )
+    assert run_hook(hook_box, "claude", event(hook_box)) == {}
+    fresh = send(hook_box, author, target)
+    prompt = event(hook_box, name="UserPromptSubmit")
+    assert [n["id"] for n in letters(run_hook(hook_box, "claude", prompt))] == [
+        fresh["id"]
+    ]
+    assert "seen" not in json.loads(state.read_text())
+
+
+def test_new_route_leaves_old_backlog_to_check_inbox(
+    hook_box: SessionMailbox, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    author, target = join(hook_box, "author"), join(hook_box, "target")
+    old = send(hook_box, author, target)
+    # Окно, сдвинутое в будущее, делает только что отправленное письмо старше окна.
+    monkeypatch.setattr("agent_inbox.session_hook.FIRST_LOOK", timedelta(hours=-1))
+    assert (
+        run_hook(hook_box, "claude", event(hook_box, context=target["context_id"]))
+        == {}
+    )
+    assert unread(hook_box, target) == [old["id"]]
