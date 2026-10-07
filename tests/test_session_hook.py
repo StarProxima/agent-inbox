@@ -3,6 +3,7 @@
 import hashlib
 import io
 import json
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Iterator
@@ -635,3 +636,18 @@ def test_new_route_leaves_old_backlog_to_check_inbox(
         == {}
     )
     assert unread(hook_box, target) == [old["id"]]
+
+
+def test_spent_budget_skips_read_marks_but_still_delivers(
+    hook_box: SessionMailbox,
+) -> None:
+    author, target = join(hook_box, "author"), join(hook_box, "target")
+    message = send(hook_box, author, target)
+    result = run_hook(
+        hook_box,
+        "claude",
+        event(hook_box, context=target["context_id"]),
+        deadline=time.monotonic(),
+    )
+    assert [n["id"] for n in letters(result)] == [message["id"]]
+    assert unread(hook_box, target) == [message["id"]]
